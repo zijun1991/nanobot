@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # 基础配置模板（YAML 锚点）
+  nanobot-base: &nanobot-config
+    build:
+      context: .
+      dockerfile: Dockerfile.multi-instance
+    image: nanobot:latest
+    restart: unless-stopped
+    volumes:
+      # 共享 venv（只读，避免容器修改）
+      - ./venv:/opt/venv:ro
+      # 实例配置和数据
+      - ./instances/${INSTANCE_NAME}/config:/data/.nanobot
+      - ./instances/${INSTANCE_NAME}/workspace:/data/.nanobot/workspace
+    environment:
+      - INSTANCE_NAME=${INSTANCE_NAME}
+    networks:
+      - nanobot-net
+
+  # 示例实例 1: Alice（助手人格）
+  alice:
+    <<: *nanobot-config
+    container_name: nanobot-alice
+    ports:
+      - "18790:18790"
+    environment:
+      - INSTANCE_NAME=alice
+
+  # 示例实例 2: Bob（专家人格）
+  bob:
+    <<: *nanobot-config
+    container_name: nanobot-bob
+    ports:
+      - "18791:18790"
+    environment:
+      - INSTANCE_NAME=bob
+
+networks:
+  nanobot-net:
+    driver: bridge

@@ -19,6 +19,8 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+from nanobot.mcp.client import MCPClientManager
+from nanobot.mcp.tools.adapter import MCPToolAdapter
 
 
 class AgentLoop:
@@ -42,8 +44,10 @@ class AgentLoop:
         max_iterations: int = 20,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
+        mcp_config: "MCPConfig | None" = None,
+        silent: bool = False,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, MCPConfig
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
@@ -51,7 +55,9 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
-        
+        self.mcp_config = mcp_config or MCPConfig()
+        self.silent = silent
+
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -63,8 +69,9 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
         )
-        
+
         self._running = False
+        self._mcp_manager = None
         self._register_default_tools()
     
     def _register_default_tools(self) -> None:
@@ -93,12 +100,111 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+
+        # Initialize MCP manager (will start in run())
+        self._init_mcp_clients()
+
+    def _init_mcp_clients(self) -> None:
+        """Initialize MCP client manager if configured."""
+        clients_config = {}
+        if self.mcp_config and self.mcp_config.clients:
+            for name, client in self.mcp_config.clients.model_dump(exclude_unset=True).items():
+                if not client.get("enabled", False):
+                    continue
+
+                client_type = client.get("type", "stdio")
+
+                # 根据类型验证配置
+                if client_type == "stdio" and client.get("command"):
+                    clients_config[name] = client
+                elif client_type in ("http", "streamable_http") and client.get("url"):
+                    clients_config[name] = client
+                else:
+                    logger.warning(f"MCP client '{name}' has incomplete config, skipping")
+
+        if clients_config:
+            self._mcp_manager = MCPClientManager(clients_config, silent=self.silent)
+            logger.info(f"Initialized {len(clients_config)} MCP client(s)")
+
+    async def _register_mcp_tools(self) -> None:
+        """Register tools from MCP servers."""
+        if not self._mcp_manager:
+            return
+
+        try:
+            all_tools = await self._mcp_manager.list_all_tools()
+            registered_count = 0
+
+            for client_name, tools in all_tools.items():
+                client = self._mcp_manager.get_client(client_name)
+                if not client:
+                    continue
+
+                for tool_def in tools:
+                    try:
+                        adapter = MCPToolAdapter(
+                            client_name=client_name,
+                            mcp_tool=tool_def,
+                            client_session=client.session,
+                        )
+                        self.tools.register(adapter)
+                        registered_count += 1
+                        logger.debug(f"Registered MCP tool: {adapter.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to register MCP tool {tool_def.get('name')}: {e}")
+
+            logger.info(f"Registered {registered_count} MCP tool(s)")
+        except Exception as e:
+            logger.error(f"Failed to register MCP tools: {e}")
+
+    def _get_mcp_info(self) -> str | None:
+        """Get information about connected MCP servers for system prompt."""
+        if not self._mcp_manager:
+            logger.debug("No MCP manager configured")
+            return None
+
+        clients = self._mcp_manager.get_all_clients()
+        logger.debug(f"Connected MCP clients: {list(clients.keys())}")
+
+        if not clients:
+            logger.debug("No MCP clients connected")
+            return None
+
+        # Build info about connected MCP servers
+        server_info = []
+        for name, client in clients.items():
+            client_type = client.client_type
+            info = f"- **{name}** (type: {client_type})"
+
+            # Add additional info based on type
+            if client_type == "stdio":
+                command = client.config.get("command", "")
+                info += f" - 命令: `{command}`"
+            elif client_type in ["http", "streamable_http"]:
+                url = client.config.get("url", "")
+                info += f" - URL: `{url}`"
+
+            server_info.append(info)
+
+        if not server_info:
+            logger.debug("No MCP server info to display")
+            return None
+
+        mcp_info = "\n".join(server_info)
+
+        logger.debug(f"MCP Info for system prompt:\n{mcp_info}")
+        return mcp_info
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
         logger.info("Agent loop started")
-        
+
+        # Start MCP clients if configured
+        if self._mcp_manager:
+            await self._mcp_manager.start()
+            await self._register_mcp_tools()
+
         while self._running:
             try:
                 # Wait for next message
@@ -106,7 +212,7 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
-                
+
                 # Process it
                 try:
                     response = await self._process_message(msg)
@@ -122,9 +228,31 @@ class AgentLoop:
                     ))
             except asyncio.TimeoutError:
                 continue
+
+        # Clean up MCP clients after loop exits (same task)
+        if self._mcp_manager:
+            try:
+                await self._mcp_manager.stop()
+            except Exception as e:
+                logger.error(f"Error stopping MCP clients: {e}")
+        logger.info("Agent loop stopped")
     
     def stop(self) -> None:
-        """Stop the agent loop."""
+        """Stop the agent loop.
+
+        Note: This is a synchronous stop that only sets the flag.
+        For proper cleanup, use stop_async() instead.
+        """
+        self._running = False
+        logger.info("Agent loop stopping")
+
+    async def stop_async(self) -> None:
+        """Async version of stop for proper cleanup.
+
+        Note: If the agent is running via run(), MCP clients will be
+        cleaned up automatically when run() exits. This method is
+        primarily for cleanup when using process_direct().
+        """
         self._running = False
         logger.info("Agent loop stopping")
     
@@ -158,10 +286,13 @@ class AgentLoop:
             spawn_tool.set_context(msg.channel, msg.chat_id)
         
         # Build initial messages (use get_history for LLM-formatted messages)
+        mcp_info = self._get_mcp_info()
+        logger.debug(f"MCP info to pass to build_messages: {mcp_info is not None}")
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
             media=msg.media if msg.media else None,
+            mcp_info=mcp_info,
         )
         
         # Agent loop
@@ -318,20 +449,36 @@ class AgentLoop:
     async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:
         """
         Process a message directly (for CLI usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier.
-        
+
         Returns:
             The agent's response.
         """
-        msg = InboundMessage(
-            channel="cli",
-            sender_id="user",
-            chat_id="direct",
-            content=content
-        )
-        
-        response = await self._process_message(msg)
-        return response.content if response else ""
+        # Start MCP clients if needed (for CLI usage)
+        if self._mcp_manager and not getattr(self, '_mcp_started', False):
+            await self._mcp_manager.start()
+            await self._register_mcp_tools()
+            self._mcp_started = True
+
+        try:
+            msg = InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="direct",
+                content=content
+            )
+
+            response = await self._process_message(msg)
+            return response.content if response else ""
+        finally:
+            # Immediately clean up MCP clients in the same task
+            if self._mcp_manager and getattr(self, '_mcp_started', False):
+                try:
+                    await asyncio.wait_for(self._mcp_manager.stop(), timeout=2.0)
+                except (asyncio.TimeoutError, RuntimeError, asyncio.CancelledError):
+                    # Expected errors during shutdown - ignore
+                    pass
+                self._mcp_started = False

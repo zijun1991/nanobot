@@ -204,6 +204,7 @@ def gateway(
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        mcp_config=config.mcp,
     )
     
     # Create cron service
@@ -256,16 +257,32 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+
+            # Create tasks
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+
+            # Wait for them
+            await asyncio.gather(agent_task, channels_task)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+            # Stop agent gracefully (will clean up MCP clients in run())
+            agent.stop()
             heartbeat.stop()
             cron.stop()
-            agent.stop()
-            await channels.stop_all()
+
+            # Wait for agent to complete cleanup
+            try:
+                await asyncio.wait_for(agent_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                # Stop channels
+                await channels.stop_all()
     
     asyncio.run(run())
 
@@ -281,13 +298,23 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress nanobot log output"),
+    silent: bool = typer.Option(False, "--silent", help="Suppress all output including MCP server logs"),
 ):
     """Interact with the agent directly."""
     from nanobot.config.loader import load_config
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.agent.loop import AgentLoop
-    
+
+    # Suppress logs if quiet or silent mode
+    if quiet or silent:
+        import sys
+        from loguru import logger as loguru_logger
+        # Remove default handler and add a null handler
+        loguru_logger.remove()
+        loguru_logger.add(sys.stderr, level="WARNING")
+
     config = load_config()
     
     api_key = config.get_api_key()
@@ -312,6 +339,8 @@ def agent(
         workspace=config.workspace_path,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        mcp_config=config.mcp,
+        silent=silent,
     )
     
     if message:
@@ -319,25 +348,25 @@ def agent(
         async def run_once():
             response = await agent_loop.process_direct(message, session_id)
             console.print(f"\n{__logo__} {response}")
-        
+
         asyncio.run(run_once())
     else:
         # Interactive mode
         console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
-        
+
         async def run_interactive():
             while True:
                 try:
                     user_input = console.input("[bold blue]You:[/bold blue] ")
                     if not user_input.strip():
                         continue
-                    
+
                     response = await agent_loop.process_direct(user_input, session_id)
                     console.print(f"\n{__logo__} {response}\n")
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
                     break
-        
+
         asyncio.run(run_interactive())
 
 
@@ -650,6 +679,210 @@ def status():
         console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
         vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
         console.print(f"vLLM/Local: {vllm_status}")
+
+
+# ============================================================================
+# MCP Commands
+# ============================================================================
+
+mcp_app = typer.Typer(help="Manage MCP (Model Context Protocol) servers and clients")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("server")
+def mcp_server(
+    port: int = typer.Option(18791, "--port", "-p", help="MCP server port"),
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="MCP server host"),
+):
+    """Start the nanobot MCP server."""
+    import asyncio
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+
+    if not config.mcp.servers.enabled:
+        console.print("[yellow]MCP server is disabled in config[/yellow]")
+        console.print("Enable it in ~/.nanobot/config.json under mcp.servers.enabled")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Starting MCP server on {host}:{port}...")
+    console.print("[dim]MCP server implementation coming soon[/dim]")
+    # TODO: Implement MCP server
+    raise typer.Exit(0)
+
+
+@mcp_app.command("list-clients")
+def mcp_list_clients():
+    """List configured MCP clients."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+
+    clients = config.mcp.clients.model_dump(exclude_unset=True)
+
+    if not clients:
+        console.print("No MCP clients configured.")
+        return
+
+    table = Table(title="MCP Clients")
+    table.add_column("Name", style="cyan")
+    table.add_column("Type", style="magenta")
+    table.add_column("Enabled", style="green")
+    table.add_column("Config", style="yellow")
+
+    for name, client_config in clients.items():
+        enabled = "✓" if client_config.get("enabled", False) else "✗"
+        client_type = client_config.get("type", "stdio")
+
+        # 根据类型显示不同的配置信息
+        if client_type in ("http", "streamable_http"):
+            url = client_config.get("url", "[dim]N/A[/dim]")
+            headers_count = len(client_config.get("headers", {}))
+            config_info = f"URL: {url}\nHeaders: {headers_count}"
+        else:  # stdio
+            command = client_config.get("command", "[dim]N/A[/dim]")
+            args = " ".join(client_config.get("args", [])) or "[dim]N/A[/dim]"
+            config_info = f"Cmd: {command}\nArgs: {args}"
+
+        table.add_row(name, client_type, enabled, config_info)
+
+    console.print(table)
+
+
+@mcp_app.command("test-client")
+def mcp_test_client(
+    client_name: str = typer.Argument(..., help="Client name to test"),
+):
+    """Test connection to an MCP client."""
+    import asyncio
+
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+
+    # Get client config
+    clients_dict = config.mcp.clients.model_dump(exclude_unset=True)
+    if client_name not in clients_dict:
+        console.print(f"[red]Client '{client_name}' not found in config[/red]")
+        raise typer.Exit(1)
+
+    client_config = clients_dict[client_name]
+
+    if not client_config.get("enabled", False):
+        console.print(f"[yellow]Client '{client_name}' is disabled[/yellow]")
+        raise typer.Exit(1)
+
+    # 根据类型验证配置
+    client_type = client_config.get("type", "stdio")
+
+    if client_type == "stdio":
+        if not client_config.get("command"):
+            console.print(f"[red]Client '{client_name}' has no command configured[/red]")
+            raise typer.Exit(1)
+    elif client_type in ("http", "streamable_http"):
+        if not client_config.get("url"):
+            console.print(f"[red]Client '{client_name}' has no url configured[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print(f"[red]Client '{client_name}' has unsupported type: {client_type}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Testing MCP client '{client_name}' (type: {client_type})...")
+
+    async def test():
+        from nanobot.mcp.client import MCPClient
+
+        client = MCPClient(name=client_name, config=client_config)
+
+        try:
+            await client.connect()
+
+            # List tools
+            tools = await client.list_tools()
+            console.print(f"\n[green]✓[/green] Connected successfully!")
+            console.print(f"Found {len(tools)} tool(s):")
+
+            for tool in tools:
+                # Handle both dict and Pydantic model
+                if isinstance(tool, dict):
+                    name = tool.get("name", "unknown")
+                    desc = tool.get("description", "[dim]No description[/dim]")
+                else:
+                    name = getattr(tool, "name", "unknown")
+                    desc = getattr(tool, "description", "[dim]No description[/dim]")
+                console.print(f"  - [cyan]{name}[/cyan]: {desc}")
+
+            await client.disconnect()
+
+        except Exception as e:
+            console.print(f"\n[red]✗[/red] Failed to connect: {e}")
+            raise typer.Exit(1)
+
+    asyncio.run(test())
+
+
+@mcp_app.command("import")
+def mcp_import(
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing config"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported"),
+):
+    """Import MCP configuration from Claude Desktop."""
+    from nanobot.config.loader import load_config, save_config
+    from nanobot.config.importer import load_claude_desktop_mcp_config, get_claude_desktop_config_path
+    from nanobot.config.schema import MCPClientConfig, MCPClientsConfig
+
+    config_path = get_claude_desktop_config_path()
+
+    if not config_path.exists():
+        console.print(f"[red]Claude Desktop config not found at: {config_path}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Reading Claude Desktop config from: {config_path}")
+
+    mcp_servers = load_claude_desktop_mcp_config()
+    if not mcp_servers:
+        console.print("[yellow]No MCP servers found in Claude Desktop config[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"\nFound {len(mcp_servers)} MCP server(s):")
+    for name in mcp_servers.keys():
+        console.print(f"  - {name}")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run mode - no changes will be made[/yellow]")
+        return
+
+    config = load_config()
+
+    # 检查是否有现有配置
+    existing_clients = config.mcp.clients.model_dump(exclude_unset=True)
+    if existing_clients and not overwrite:
+        console.print("\n[yellow]Warning: Existing MCP clients config found[/yellow]")
+        if not typer.confirm("Do you want to continue? This will merge with existing config."):
+            raise typer.Exit(0)
+
+    # 导入配置
+    imported = {}
+    for name, server_config in mcp_servers.items():
+        imported[name] = {
+            "enabled": True,
+            "command": server_config.get("command"),
+            "args": server_config.get("args", []),
+            "env": server_config.get("env", {}),
+        }
+
+    # 合并或替换配置
+    if overwrite:
+        config.mcp.clients = MCPClientsConfig(**imported)
+    else:
+        # 合并：保留 nanobot 特有的配置，添加/更新从 Claude Desktop 导入的
+        for name, client_config in imported.items():
+            setattr(config.mcp.clients, name, MCPClientConfig(**client_config))
+
+    # 保存配置
+    save_config(config)
+    console.print(f"\n[green]✓[/green] MCP configuration imported successfully")
+    console.print(f"\nRun [cyan]nanobot mcp list-clients[/cyan] to see the imported clients")
 
 
 if __name__ == "__main__":

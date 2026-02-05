@@ -312,6 +312,148 @@ Config file: `~/.nanobot/config.json`
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |
 
+## 🔌 MCP (Model Context Protocol) Support
+
+nanobot supports MCP (Model Context Protocol) for extending its capabilities with external tools and servers.
+
+### What is MCP?
+
+MCP is an open protocol that allows AI applications to:
+- **Connect to external servers** and use their tools
+- **Expose its own tools** to other MCP clients
+
+### MCP Client Mode (Using External Tools)
+
+Connect nanobot to external MCP servers to use their tools.
+
+#### 1. Import from Claude Desktop
+
+If you already have MCP servers configured in Claude Desktop, you can import them:
+
+```bash
+# Preview what will be imported
+nanobot mcp import --dry-run
+
+# Import Claude Desktop MCP configuration
+nanobot mcp import
+
+# Overwrite existing config
+nanobot mcp import --overwrite
+```
+
+#### 2. Manual Configuration
+
+Edit `~/.nanobot/config.json`:
+
+```json
+{
+  "mcp": {
+    "clients": {
+      "filesystem": {
+        "enabled": true,
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/yourname/projects"],
+        "env": {}
+      },
+      "github": {
+        "enabled": true,
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env": {
+          "GITHUB_TOKEN": "your_github_token"
+        }
+      }
+    }
+  }
+}
+```
+
+#### 3. Test MCP Clients
+
+```bash
+# List configured clients
+nanobot mcp list-clients
+
+# Test a specific client connection
+nanobot mcp test-client filesystem
+```
+
+#### 4. Use MCP Tools
+
+When you start the gateway or agent, MCP tools are automatically loaded:
+
+```bash
+# Start gateway with MCP tools
+nanobot gateway
+
+# Or use in agent mode
+nanobot agent -m "List files in my projects directory using the filesystem tool"
+```
+
+MCP tools are prefixed with `mcp_<client_name>_` (e.g., `mcp_filesystem_read_file`).
+
+### MCP Server Mode (Exposing Nanobot Tools)
+
+Run nanobot as an MCP server to expose its tools to other applications.
+
+#### 1. Enable MCP Server
+
+Edit `~/.nanobot/config.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 18791,
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+#### 2. Start MCP Server
+
+```bash
+nanobot mcp server --port 18791
+```
+
+#### 3. Connect from Claude Desktop
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "nanobot": {
+      "command": "nanobot",
+      "args": ["mcp", "server"]
+    }
+  }
+}
+```
+
+### Available MCP Servers
+
+Here are some popular MCP servers you can use with nanobot:
+
+| Server | Description | Install |
+|--------|-------------|---------|
+| `@modelcontextprotocol/server-filesystem` | File system operations | `npx -y @modelcontextprotocol/server-filesystem /path` |
+| `@modelcontextprotocol/server-github` | GitHub integration | `npx -y @modelcontextprotocol/server-github` |
+| `@modelcontextprotocol/server-postgres` | PostgreSQL database | `npx -y @modelcontextprotocol/server-postgres` |
+| `@modelcontextprotocol/server-brave-search` | Brave Search | `npx -y @modelcontextprotocol/server-brave-search` |
+
+### MCP CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `nanobot mcp import` | Import config from Claude Desktop |
+| `nanobot mcp list-clients` | List configured MCP clients |
+| `nanobot mcp test-client <name>` | Test MCP client connection |
+| `nanobot mcp server` | Start MCP server |
+
 <details>
 <summary><b>Scheduled Tasks (Cron)</b></summary>
 
@@ -365,6 +507,10 @@ nanobot/
 │   ├── skills.py   #    Skills loader
 │   ├── subagent.py #    Background task execution
 │   └── tools/      #    Built-in tools (incl. spawn)
+├── mcp/            # 🔌 MCP (Model Context Protocol) support
+│   ├── client.py   #    MCP client manager
+│   ├── server.py   #    MCP server implementation
+│   └── tools/      #    MCP tool adapters
 ├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
 ├── channels/       # 📱 WhatsApp integration
 ├── bus/            # 🚌 Message routing

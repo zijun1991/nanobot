@@ -1,5 +1,6 @@
 .assets
 .env
+.venv
 *.pyc
 dist/
 build/
@@ -13,3 +14,27 @@ docs/
 *.pyz
 *.pywz
 *.pyzz
+
+# Python 虚拟环境
+venv/
+venv.tar.gz
+__pycache__/
+
+# Docker 多实例部署 - 数据目录
+instances/
+*.tar.gz
+
+# Node.js 依赖
+node_modules/
+package-lock.json
+bridge/node_modules/
+bridge/package-lock.json
+
+# 测试文件
+test_mcp_server.py
+*_test.py
+
+# 其他临时文件
+*.tmp
+*.log
+.DS_Store

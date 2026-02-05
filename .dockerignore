@@ -8,6 +8,17 @@ build/
 .git
 .env
 .assets
-node_modules/
-bridge/dist/
+# 保留 bridge/node_modules 用于 Docker 构建
+# node_modules/
+# bridge/dist/
 workspace/
+
+# Docker 多实例部署排除项
+venv/
+venv.tar.gz
+instances/
+# 保留 scripts 用于管理
+# scripts/
+docker/
+*.md
+!README.md

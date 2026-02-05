@@ -1,0 +1,81 @@
+# ============ Stage 1: venv Builder ============
+# 这个阶段构建包含 Python 3.12 和所有依赖的 venv
+# 并导出为 tar.gz 供宿主机使用
+FROM python:3.12-slim AS venv-builder
+
+# 安装构建依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# 创建 venv（使用 --copies 包含完整的 Python 解释器）
+RUN python -m venv --copies /opt/venv
+
+# 复制 libpython 共享库到 venv
+RUN cp /usr/local/lib/libpython3.12.so* /opt/venv/lib/ && \
+    chmod +x /opt/venv/lib/libpython*.so*
+
+# 复制 Python 标准库到 venv
+RUN cp -r /usr/local/lib/python3.12 /opt/venv/lib/ && \
+    cp -r /usr/local/include/python3.12 /opt/venv/include/
+
+# 修改 pyvenv.cfg 使 venv 完全自包含
+RUN sed -i 's|home = /usr/local/bin|home = /opt/venv/bin|' /opt/venv/pyvenv.cfg && \
+    sed -i 's|executable = /usr/local/bin/python3.12|executable = /opt/venv/bin/python|' /opt/venv/pyvenv.cfg
+
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONHOME="/opt/venv"
+
+# 升级 pip 和安装构建工具
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# 复制项目文件
+WORKDIR /tmp/build
+COPY nanobot/ ./nanobot/
+COPY bridge/ ./bridge/
+COPY pyproject.toml README.md LICENSE ./
+
+# 安装 nanobot 及其所有依赖
+RUN pip install --no-cache-dir -e .
+
+# 导出 venv 为 tar.gz（供宿主机使用）
+RUN cd /opt && tar czf /venv.tar.gz venv/
+
+# ============ Stage 2: Runtime Image ============
+# 运行时镜像不含 Python，通过卷挂载使用 venv
+# 使用与 Python 基础镜像相同版本的 Debian 以确保 GLIBC 兼容性
+FROM debian:trixie-slim
+
+# 安装运行时依赖（不含 Python）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+# 创建目录结构
+RUN mkdir -p /app /data/.nanobot/{workspace,sessions,cron} /opt
+
+# 复制源码（从 builder 阶段）
+WORKDIR /app
+COPY --from=venv-builder /tmp/build /app/
+
+# 复制启动脚本
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 环境变量（venv 通过卷挂载提供 Python）
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+ENV NANOBOT_CONFIG=/data/.nanobot/config.json
+ENV HOME=/data
+
+# 健康检查（使用 venv 中的 Python）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD /opt/venv/bin/python -c "import sys; exit(0)" || exit 1
+
+EXPOSE 18790
+
+# 使用启动脚本，默认运行 nanobot gateway
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["-m", "nanobot", "gateway"]

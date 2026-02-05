@@ -24,20 +24,21 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None, mcp_info: str | None = None) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
-        
+
         Args:
             skill_names: Optional list of skills to include.
-        
+            mcp_info: Optional MCP servers information.
+
         Returns:
             Complete system prompt.
         """
         parts = []
-        
-        # Core identity
-        parts.append(self._get_identity())
+
+        # Core identity (with MCP info)
+        parts.append(self._get_identity(mcp_info))
         
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
@@ -48,7 +49,7 @@ class ContextBuilder:
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
-        
+
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
         always_skills = self.skills.get_always_skills()
@@ -67,14 +68,28 @@ Skills with available="false" need dependencies installed first - you can try in
 
 {skills_summary}""")
         
-        return "\n\n---\n\n".join(parts)
+        result = "\n\n---\n\n".join(parts)
+
+        # Debug: log if MCP info is included
+        if mcp_info:
+            from loguru import logger
+            logger.info("System prompt includes MCP info")
+
+        return result
     
-    def _get_identity(self) -> str:
+    def _get_identity(self, mcp_info: str | None = None) -> str:
         """Get the core identity section."""
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
-        
+
+        mcp_section = ""
+        if mcp_info:
+            mcp_section = f"""
+
+{mcp_info}
+"""
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
@@ -83,7 +98,7 @@ You are nanobot, a helpful AI assistant. You have access to tools that allow you
 - Search the web and fetch web pages
 - Send messages to users on chat channels
 - Spawn subagents for complex background tasks
-
+{mcp_section}
 ## Current Time
 {now}
 
@@ -118,6 +133,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         current_message: str,
         skill_names: list[str] | None = None,
         media: list[str] | None = None,
+        mcp_info: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -127,6 +143,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             current_message: The new user message.
             skill_names: Optional skills to include.
             media: Optional list of local file paths for images/media.
+            mcp_info: Optional MCP servers information.
 
         Returns:
             List of messages including system prompt.
@@ -134,7 +151,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(skill_names, mcp_info)
         messages.append({"role": "system", "content": system_prompt})
 
         # History
